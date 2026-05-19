@@ -159,9 +159,9 @@ export const AI_ATTR_MAP = {
  * - **OpenInference** (`input.value` / `output.value`): Arize Phoenix /
  *   LangChain-style normalized input/output.
  *
- * Keys here trigger FTS indexing on insert via a trigger in TelemetryStore.
- * Adding a key requires a one-time backfill; removing one leaves orphan
- * FTS entries that get cleaned up on next retention pass.
+ * TelemetryStore uses this list as the single source of truth for AI content
+ * indexing, AI span detection, and text search fallback predicates. Changing
+ * the list changes the search-index version and triggers a rebuild.
  */
 export const AI_FTS_KEYS = [
 	// Vercel AI SDK
@@ -189,9 +189,9 @@ export const AI_FTS_KEYS = [
 ] as const
 
 /**
- * Back-compat alias. The `text` filter on `/api/ai/calls` historically
- * LIKE-searched these four keys; now FTS indexes the broader AI_FTS_KEYS
- * set so the filter transparently covers more content.
+ * Public compatibility alias for package consumers that imported the old AI
+ * text-search key list directly. Internal code should use AI_FTS_KEYS as the
+ * source of truth.
  */
 export const AI_TEXT_SEARCH_KEYS = AI_FTS_KEYS
 

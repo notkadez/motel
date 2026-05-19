@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { AI_FTS_KEYS, isAiSpan } from "./domain.ts"
+import { AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, isAiSpan } from "./domain.ts"
+
+describe("AI text search keys", () => {
+	test("keeps the public compatibility alias pointed at the canonical key list", () => {
+		expect(AI_TEXT_SEARCH_KEYS).toBe(AI_FTS_KEYS)
+	})
+})
 
 describe("isAiSpan", () => {
 	test("returns false for empty tags", () => {
