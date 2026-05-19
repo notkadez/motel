@@ -3,14 +3,70 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test"
 import { copyFileSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Effect, References } from "effect"
+import { Effect, ManagedRuntime, References } from "effect"
 import { attributeFiltersFromArgs, attributeContainsFiltersFromArgs, isAttributeFilterToken, isAttributeContainsToken } from "./queryFilters.js"
+
+const runTelemetryStoreStartup = async (databasePath: string) => {
+	const script = `
+		import { Database } from "bun:sqlite"
+		import { Effect, ManagedRuntime, References } from "effect"
+		const { TelemetryStore, makeTelemetryStoreLayer } = await import("./src/services/TelemetryStore.ts")
+		const runtime = ManagedRuntime.make(makeTelemetryStoreLayer({ readonly: false, runRetention: false }))
+		const waitForRepair = async () => {
+			const deadline = Date.now() + 10_000
+			while (Date.now() < deadline) {
+				const db = new Database(${JSON.stringify(databasePath)}, { readonly: true })
+				try {
+					const operationMarker = db.query("SELECT value FROM telemetry_store_meta WHERE key = 'span_operation_search_index'").get()
+					const aiTextMarker = db.query("SELECT value FROM telemetry_store_meta WHERE key = 'ai_text_search_index'").get()
+					const logBodyMarker = db.query("SELECT value FROM telemetry_store_meta WHERE key = 'log_body_search_index'").get()
+					if (operationMarker && aiTextMarker && logBodyMarker) return
+				} catch {
+					// The writer may still be finishing schema setup.
+				} finally {
+					db.close()
+				}
+				await Bun.sleep(100)
+			}
+			throw new Error("timed out waiting for search index repair")
+		}
+		try {
+			await runtime.runPromise(
+				Effect.flatMap(TelemetryStore, () => Effect.void).pipe(
+					Effect.provideService(References.MinimumLogLevel, "None"),
+				),
+			)
+			await waitForRepair()
+		} finally {
+			await runtime.dispose().catch(() => undefined)
+		}
+	`
+	const proc = Bun.spawn(["bun", "--eval", script], {
+		cwd: process.cwd(),
+		env: {
+			...process.env,
+			MOTEL_OTEL_DB_PATH: databasePath,
+			MOTEL_OTEL_RETENTION_HOURS: "24",
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	})
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	])
+	if (exitCode !== 0) {
+		throw new Error(`telemetry store startup failed (${exitCode})\n${stdout}\n${stderr}`)
+	}
+}
 
 describe("motel telemetry store", () => {
 	const tempDir = mkdtempSync(join(tmpdir(), "motel-test-"))
 	const dbPath = join(tempDir, "telemetry.sqlite")
 	let storeRuntime: Awaited<typeof import("./runtime.ts")>["storeRuntime"]
 	let TelemetryStore: Awaited<typeof import("./services/TelemetryStore.ts")>["TelemetryStore"]
+	let makeTelemetryStoreLayer: Awaited<typeof import("./services/TelemetryStore.ts")>["makeTelemetryStoreLayer"]
 	let motelOpenApiSpec: Awaited<typeof import("./httpApi.ts")>["motelOpenApiSpec"]
 
 	beforeAll(async () => {
@@ -18,7 +74,7 @@ describe("motel telemetry store", () => {
 		process.env.MOTEL_OTEL_RETENTION_HOURS = "24"
 		const suffix = `?test=${Date.now()}`
 		;({ storeRuntime } = await import(`./runtime.ts${suffix}`))
-		;({ TelemetryStore } = await import(`./services/TelemetryStore.ts${suffix}`))
+		;({ TelemetryStore, makeTelemetryStoreLayer } = await import(`./services/TelemetryStore.ts${suffix}`))
 		;({ motelOpenApiSpec } = await import(`./httpApi.ts${suffix}`))
 
 		const nowNanos = BigInt(Date.now()) * 1_000_000n
@@ -483,6 +539,19 @@ describe("motel telemetry store", () => {
 		expect(result[0]?.traceId).toBe("trace-1")
 	})
 
+	it("treats AI trace search text without FTS tokens as a no-op", async () => {
+		const [unfiltered, punctuationOnly] = await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) =>
+				Effect.all([
+					store.searchTraceSummaries({ serviceName: "test-api" }),
+					store.searchTraceSummaries({ serviceName: "test-api", aiText: "!!! &&&" }),
+				]),
+			).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+
+		expect(punctuationOnly.map((trace) => trace.traceId)).toEqual(unfiltered.map((trace) => trace.traceId))
+	})
+
 	it("filters logs by severity", async () => {
 		const result = await storeRuntime.runPromise(
 			Effect.flatMap(TelemetryStore, (store) =>
@@ -780,6 +849,19 @@ describe("motel telemetry store", () => {
 		expect(result.map((r) => r.spanId)).toContain("ai-stream-1")
 	})
 
+	it("treats AI call search text without FTS tokens as a no-op", async () => {
+		const [unfiltered, punctuationOnly] = await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) =>
+				Effect.all([
+					store.searchAiCalls({}),
+					store.searchAiCalls({ text: "!!! &&&" }),
+				]),
+			).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+
+		expect(punctuationOnly.map((call) => call.spanId)).toEqual(unfiltered.map((call) => call.spanId))
+	})
+
 	it("filters AI calls by operation type", async () => {
 		const result = await storeRuntime.runPromise(
 			Effect.flatMap(TelemetryStore, (store) =>
@@ -845,6 +927,414 @@ describe("motel telemetry store", () => {
 		expect(okGroup).toBeDefined()
 		expect(errorGroup).toBeDefined()
 		expect(errorGroup?.count).toBe(1)
+	})
+
+	it("writer startup rebuilds search indexes from canonical tables", async () => {
+		const migrationPath = join(tempDir, "search-index-migration.sqlite")
+		const probe = new Database(migrationPath)
+		try {
+			probe.exec(`
+				CREATE TABLE spans (
+					trace_id TEXT NOT NULL,
+					span_id TEXT NOT NULL,
+					parent_span_id TEXT,
+					service_name TEXT NOT NULL,
+					scope_name TEXT,
+					operation_name TEXT NOT NULL,
+					kind TEXT,
+					start_time_ms INTEGER NOT NULL,
+					end_time_ms INTEGER NOT NULL,
+					duration_ms REAL NOT NULL,
+					status TEXT NOT NULL,
+					attributes_json TEXT NOT NULL,
+					resource_json TEXT NOT NULL,
+					events_json TEXT NOT NULL,
+					PRIMARY KEY (trace_id, span_id)
+				);
+
+				CREATE TABLE span_attributes (
+					trace_id TEXT NOT NULL,
+					span_id TEXT NOT NULL,
+					key TEXT NOT NULL,
+					value TEXT NOT NULL,
+					PRIMARY KEY (trace_id, span_id, key)
+				);
+
+				CREATE TABLE logs (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					trace_id TEXT,
+					span_id TEXT,
+					service_name TEXT NOT NULL,
+					scope_name TEXT,
+					severity_text TEXT NOT NULL,
+					timestamp_ms INTEGER NOT NULL,
+					body TEXT NOT NULL,
+					attributes_json TEXT NOT NULL,
+					resource_json TEXT NOT NULL
+				);
+
+				CREATE VIRTUAL TABLE span_operation_fts USING fts5(
+					trace_id UNINDEXED,
+					span_id UNINDEXED,
+					operation_name,
+					tokenize='unicode61'
+				);
+
+				CREATE VIRTUAL TABLE span_attr_fts USING fts5(
+					value,
+					content='span_attributes',
+					content_rowid='rowid',
+					tokenize='unicode61 remove_diacritics 2'
+				);
+
+				CREATE VIRTUAL TABLE log_body_fts USING fts5(
+					log_id UNINDEXED,
+					body,
+					tokenize='unicode61'
+				);
+
+				CREATE TRIGGER span_attr_fts_ai AFTER INSERT ON span_attributes
+				BEGIN
+					INSERT INTO span_attr_fts(rowid, value) VALUES (new.rowid, new.value);
+				END;
+
+				INSERT INTO spans(
+					trace_id, span_id, parent_span_id, service_name, scope_name, operation_name, kind,
+					start_time_ms, end_time_ms, duration_ms, status, attributes_json, resource_json, events_json
+				)
+				VALUES
+					('trace-migrate', 'span-migrate', NULL, 'migration-api', 'migration-test', 'newop', 'INTERNAL', 1, 2, 1, 'ok', '{}', '{}', '[]'),
+					('trace-stale-only', 'span-stale-only', NULL, 'migration-api', 'migration-test', 'createdop', 'INTERNAL', 3, 4, 1, 'ok', '{}', '{}', '[]');
+
+				INSERT INTO span_operation_fts(rowid, trace_id, span_id, operation_name)
+				VALUES
+					(1, 'trace-migrate', 'span-migrate', 'oldop'),
+					(2, 'trace-migrate', 'span-migrate', 'newop'),
+					(3, 'trace-stale-only', 'span-stale-only', 'staleop');
+
+				INSERT INTO span_attributes(trace_id, span_id, key, value)
+				VALUES
+					('trace-ai-migrate', 'span-ai-migrate', 'ai.response.text', 'legacy searchable answer'),
+					('trace-ai-migrate', 'span-ai-migrate', 'http.method', 'legacy searchable answer');
+
+				INSERT INTO span_attr_fts(rowid, value)
+				SELECT rowid, value FROM span_attributes;
+
+				INSERT INTO logs(id, trace_id, span_id, service_name, scope_name, severity_text, timestamp_ms, body, attributes_json, resource_json)
+				VALUES (1, 'trace-log-migrate', 'span-log-migrate', 'migration-api', 'migration-test', 'INFO', 5, 'fresh log body alpha gap beta', '{}', '{}');
+
+				INSERT INTO log_body_fts(rowid, log_id, body)
+				VALUES (42, 1, 'stale log body');
+			`)
+
+			const externalContentCount = (probe.query(`SELECT COUNT(*) AS c FROM span_attr_fts`).get() as { c: number }).c
+			expect(externalContentCount).toBe(2)
+			probe.close()
+
+			await runTelemetryStoreStartup(migrationPath)
+
+			const repaired = new Database(migrationPath)
+			try {
+				const ftsCount = (repaired.query(`SELECT COUNT(*) AS c FROM span_operation_fts`).get() as { c: number }).c
+
+				const searchOperations = (operation: string) =>
+					repaired.query(`
+						SELECT s.operation_name
+						FROM span_operation_fts
+						JOIN span_operation_index AS soi
+							ON soi.fts_rowid = span_operation_fts.rowid
+						JOIN spans AS s
+							ON s.trace_id = soi.trace_id
+							AND s.span_id = soi.span_id
+						WHERE span_operation_fts MATCH ?
+						ORDER BY s.operation_name
+					`).all(operation) as Array<{ operation_name: string }>
+
+				const matches = repaired.query(`
+					SELECT sa.key
+					FROM span_attr_fts fts
+					JOIN span_attributes sa ON sa.rowid = fts.rowid
+					WHERE fts.value MATCH ?
+					ORDER BY sa.key
+				`).all("legacy") as Array<{ key: string }>
+				const searchLogBodies = (body: string) =>
+					repaired.query(`
+						SELECT logs.body
+						FROM log_body_fts
+						JOIN logs ON logs.id = CAST(log_body_fts.log_id AS INTEGER)
+						WHERE log_body_fts MATCH ?
+						ORDER BY logs.body
+					`).all(body) as Array<{ body: string }>
+				const operationMarker = repaired.query(`SELECT value FROM telemetry_store_meta WHERE key = 'span_operation_search_index'`).get()
+				const aiTextMarker = repaired.query(`SELECT value FROM telemetry_store_meta WHERE key = 'ai_text_search_index'`).get()
+				const logBodyMarker = repaired.query(`SELECT value FROM telemetry_store_meta WHERE key = 'log_body_search_index'`).get()
+				const indexCount = (repaired.query(`SELECT COUNT(*) AS c FROM span_attr_fts_index`).get() as { c: number }).c
+				const triggerCount = (repaired.query(`
+					SELECT COUNT(*) AS c
+					FROM sqlite_master
+					WHERE type = 'trigger'
+						AND name IN ('span_attr_fts_ai', 'span_attr_fts_ad', 'span_attr_fts_au')
+				`).get() as { c: number }).c
+
+				expect(searchOperations("oldop")).toHaveLength(0)
+				expect(searchOperations("staleop")).toHaveLength(0)
+				expect(ftsCount).toBe(2)
+				expect(searchOperations("newop").map((row) => row.operation_name)).toEqual(["newop"])
+				expect(searchOperations("createdop").map((row) => row.operation_name)).toEqual(["createdop"])
+				expect(operationMarker).not.toBeNull()
+				expect(aiTextMarker).not.toBeNull()
+				expect(logBodyMarker).not.toBeNull()
+				expect(indexCount).toBe(1)
+				expect(triggerCount).toBe(0)
+				expect(matches.map((row) => row.key)).toEqual(["ai.response.text"])
+				expect(searchLogBodies("stale")).toHaveLength(0)
+				expect(searchLogBodies("fresh").map((row) => row.body)).toEqual(["fresh log body alpha gap beta"])
+			} finally {
+				repaired.close()
+			}
+		} finally {
+			try { probe.close() } catch { /* already closed before startup */ }
+		}
+	})
+
+	it("readonly stores pick up FTS repair markers without restart", async () => {
+		const operationMarkerKey = "span_operation_search_index"
+		const attrMarkerKey = "ai_text_search_index"
+		const logBodyMarkerKey = "log_body_search_index"
+		const traceId = "trace-readonly-fts-repair"
+		const spanId = "span-readonly-fts-repair"
+		const serviceName = "readonly-fts-repair-api"
+		const searchableText = "readonly alpha gap beta marker"
+		const searchableLogBody = "readonly log alpha gap beta marker"
+		const now = Date.now()
+		let operationFtsRowid = 0
+		let attrRowid = 0
+		let logId = 0
+		let operationMarkerValue: string | undefined
+		let attrMarkerValue: string | undefined
+		let logBodyMarkerValue: string | undefined
+
+		const probe = new Database(dbPath)
+		try {
+			probe.exec(`PRAGMA busy_timeout = 5000;`)
+			operationMarkerValue = (probe.query(`SELECT value FROM telemetry_store_meta WHERE key = ?`).get(operationMarkerKey) as { value: string } | null)?.value
+			attrMarkerValue = (probe.query(`SELECT value FROM telemetry_store_meta WHERE key = ?`).get(attrMarkerKey) as { value: string } | null)?.value
+			logBodyMarkerValue = (probe.query(`SELECT value FROM telemetry_store_meta WHERE key = ?`).get(logBodyMarkerKey) as { value: string } | null)?.value
+			expect(operationMarkerValue).toBe("rowid-v1")
+			expect(attrMarkerValue).toBeTruthy()
+			expect(logBodyMarkerValue).toBe("rowid-v1")
+			if (operationMarkerValue == null || attrMarkerValue == null || logBodyMarkerValue == null) {
+				throw new Error("expected FTS repair markers to exist before readonly marker test")
+			}
+
+			operationFtsRowid = ((probe.query(`SELECT COALESCE(MAX(rowid), 0) + 1000 AS rowid FROM span_operation_fts`).get() as { rowid: number }).rowid)
+
+			probe.query(`
+				INSERT OR REPLACE INTO trace_summaries(
+					trace_id, service_name, root_operation_name, started_at_ms, ended_at_ms,
+					active_span_count, duration_ms, span_count, error_count
+				) VALUES (?, ?, ?, ?, ?, 0, 1, 1, 0)
+			`).run(traceId, serviceName, searchableText, now, now + 1)
+			probe.query(`
+				INSERT OR REPLACE INTO spans(
+					trace_id, span_id, parent_span_id, service_name, scope_name, operation_name, kind,
+					start_time_ms, end_time_ms, duration_ms, status, attributes_json, resource_json, events_json
+				) VALUES (?, ?, NULL, ?, 'readonly-test', ?, 'INTERNAL', ?, ?, 1, 'OK', '{}', '{}', '[]')
+			`).run(traceId, spanId, serviceName, searchableText, now, now + 1)
+			probe.query(`
+				INSERT OR REPLACE INTO span_attributes(trace_id, span_id, key, value)
+				VALUES (?, ?, 'ai.response.text', ?)
+			`).run(traceId, spanId, searchableText)
+			const logInsert = probe.query(`
+				INSERT INTO logs(trace_id, span_id, service_name, scope_name, severity_text, timestamp_ms, body, attributes_json, resource_json)
+				VALUES (?, ?, ?, 'readonly-test', 'INFO', ?, ?, '{}', '{}')
+			`).run(traceId, spanId, serviceName, now, searchableLogBody) as { lastInsertRowid: number | bigint }
+			logId = Number(logInsert.lastInsertRowid)
+
+			attrRowid = (probe.query(`
+				SELECT rowid
+				FROM span_attributes
+				WHERE trace_id = ? AND span_id = ? AND key = 'ai.response.text'
+			`).get(traceId, spanId) as { rowid: number }).rowid
+
+			probe.query(`
+				INSERT OR REPLACE INTO span_operation_fts(rowid, trace_id, span_id, operation_name)
+				VALUES (?, ?, ?, ?)
+			`).run(operationFtsRowid, traceId, spanId, searchableText)
+			probe.query(`
+				INSERT OR REPLACE INTO span_operation_index(trace_id, span_id, fts_rowid)
+				VALUES (?, ?, ?)
+			`).run(traceId, spanId, operationFtsRowid)
+			probe.query(`INSERT INTO span_attr_fts(rowid, value) VALUES (?, ?)`).run(attrRowid, searchableText)
+			probe.query(`INSERT OR IGNORE INTO span_attr_fts_index(rowid) VALUES (?)`).run(attrRowid)
+			probe.query(`INSERT INTO log_body_fts(log_id, body) VALUES (?, ?)`).run(logId, searchableLogBody)
+			probe.query(`DELETE FROM telemetry_store_meta WHERE key IN (?, ?, ?)`).run(operationMarkerKey, attrMarkerKey, logBodyMarkerKey)
+
+			const readonlyRuntime = ManagedRuntime.make(makeTelemetryStoreLayer({ readonly: true, runRetention: false }))
+			try {
+				const beforeRepair = await readonlyRuntime.runPromise(
+					Effect.flatMap(TelemetryStore, (store) =>
+						Effect.all([
+							store.searchSpans({ serviceName, operation: "alpha beta" }),
+							store.searchTraceSummaries({ serviceName, aiText: "alpha beta" }),
+							store.searchLogs({ serviceName, body: "alpha beta" }),
+						]),
+					).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+				)
+				expect(beforeRepair[0]).toHaveLength(0)
+				expect(beforeRepair[1]).toHaveLength(0)
+				expect(beforeRepair[2]).toHaveLength(0)
+
+				probe.query(`INSERT OR REPLACE INTO telemetry_store_meta(key, value) VALUES (?, ?)`).run(operationMarkerKey, operationMarkerValue)
+				probe.query(`INSERT OR REPLACE INTO telemetry_store_meta(key, value) VALUES (?, ?)`).run(attrMarkerKey, attrMarkerValue)
+				probe.query(`INSERT OR REPLACE INTO telemetry_store_meta(key, value) VALUES (?, ?)`).run(logBodyMarkerKey, logBodyMarkerValue)
+
+				const afterRepair = await readonlyRuntime.runPromise(
+					Effect.flatMap(TelemetryStore, (store) =>
+						Effect.all([
+							store.searchSpans({ serviceName, operation: "alpha beta" }),
+							store.searchTraceSummaries({ serviceName, aiText: "alpha beta" }),
+							store.searchLogs({ serviceName, body: "alpha beta" }),
+						]),
+					).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+				)
+				expect(afterRepair[0]).toHaveLength(1)
+				expect(afterRepair[0][0]?.span.operationName).toBe(searchableText)
+				expect(afterRepair[1]).toHaveLength(1)
+				expect(afterRepair[1][0]?.traceId).toBe(traceId)
+				expect(afterRepair[2]).toHaveLength(1)
+				expect(afterRepair[2][0]?.body).toBe(searchableLogBody)
+			} finally {
+				await readonlyRuntime.dispose().catch(() => undefined)
+			}
+		} finally {
+			if (attrRowid !== 0) {
+				try {
+					probe.query(`INSERT INTO span_attr_fts(span_attr_fts, rowid, value) VALUES ('delete', ?, ?)`).run(attrRowid, searchableText)
+				} catch {
+					// Test cleanup should not mask the assertion failure.
+				}
+			}
+			if (operationFtsRowid !== 0) {
+				probe.query(`DELETE FROM span_operation_fts WHERE rowid = ?`).run(operationFtsRowid)
+			}
+			if (logId !== 0) {
+				try {
+					probe.query(`DELETE FROM log_body_fts WHERE log_id = ?`).run(logId)
+				} catch {
+					// Test cleanup should not mask the assertion failure.
+				}
+			}
+			probe.query(`DELETE FROM span_operation_index WHERE trace_id = ? AND span_id = ?`).run(traceId, spanId)
+			probe.query(`DELETE FROM span_attr_fts_index WHERE rowid = ?`).run(attrRowid)
+			probe.query(`DELETE FROM span_attributes WHERE trace_id = ? AND span_id = ?`).run(traceId, spanId)
+			probe.query(`DELETE FROM logs WHERE id = ?`).run(logId)
+			probe.query(`DELETE FROM spans WHERE trace_id = ? AND span_id = ?`).run(traceId, spanId)
+			probe.query(`DELETE FROM trace_summaries WHERE trace_id = ?`).run(traceId)
+			if (operationMarkerValue) {
+				probe.query(`INSERT OR REPLACE INTO telemetry_store_meta(key, value) VALUES (?, ?)`).run(operationMarkerKey, operationMarkerValue)
+			}
+			if (attrMarkerValue) {
+				probe.query(`INSERT OR REPLACE INTO telemetry_store_meta(key, value) VALUES (?, ?)`).run(attrMarkerKey, attrMarkerValue)
+			}
+			if (logBodyMarkerValue) {
+				probe.query(`INSERT OR REPLACE INTO telemetry_store_meta(key, value) VALUES (?, ?)`).run(logBodyMarkerKey, logBodyMarkerValue)
+			}
+			probe.close()
+		}
+	})
+
+	it("re-ingests spans without stale operation or attribute index rows", async () => {
+		const nowNanos = BigInt(Date.now()) * 1_000_000n
+		const oneSecond = 1_000_000_000n
+		const oldPayload = {
+			resourceSpans: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "reingest-api" } }] },
+				scopeSpans: [{
+					scope: { name: "reingest-test" },
+					spans: [{
+						traceId: "trace-reingest",
+						spanId: "span-reingest",
+						name: "reingest.old",
+						startTimeUnixNano: String(nowNanos),
+						endTimeUnixNano: String(nowNanos + oneSecond),
+						attributes: [
+							{ key: "stale", value: { stringValue: "old" } },
+							{ key: "ai.prompt", value: { stringValue: "still indexed stale prompt" } },
+							{ key: "ai.response.text", value: { stringValue: "orphaned stale answer" } },
+						],
+					}],
+				}],
+			}],
+		}
+		const newPayload = {
+			resourceSpans: [{
+				resource: { attributes: [{ key: "service.name", value: { stringValue: "reingest-api" } }] },
+				scopeSpans: [{
+					scope: { name: "reingest-test" },
+					spans: [{
+						traceId: "trace-reingest",
+						spanId: "span-reingest",
+						name: "reingest.new",
+						startTimeUnixNano: String(nowNanos),
+						endTimeUnixNano: String(nowNanos + 2n * oneSecond),
+						attributes: [
+							{ key: "fresh", value: { stringValue: "new" } },
+							{ key: "ai.prompt", value: { stringValue: "fresh prompt" } },
+							{ key: "ai.response.text", value: { stringValue: "fresh answer" } },
+						],
+					}],
+				}],
+			}],
+		}
+
+		await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) => store.ingestTraces(oldPayload)).pipe(
+				Effect.provideService(References.MinimumLogLevel, "None"),
+			),
+		)
+
+		const probe = new Database(dbPath)
+		try {
+			const unindexedAiRow = probe.query(`
+				SELECT rowid, value
+				FROM span_attributes
+				WHERE trace_id = ?
+					AND span_id = ?
+					AND key = 'ai.response.text'
+			`).get("trace-reingest", "span-reingest") as { rowid: number; value: string }
+			probe.query(`INSERT INTO span_attr_fts(span_attr_fts, rowid, value) VALUES ('delete', ?, ?)`).run(unindexedAiRow.rowid, unindexedAiRow.value)
+			probe.query(`DELETE FROM span_attr_fts_index WHERE rowid = ?`).run(unindexedAiRow.rowid)
+			probe.query(`DELETE FROM spans WHERE trace_id = ? AND span_id = ?`).run("trace-reingest", "span-reingest")
+			probe.query(`DELETE FROM trace_summaries WHERE trace_id = ?`).run("trace-reingest")
+		} finally {
+			probe.close()
+		}
+
+		await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) => store.ingestTraces(newPayload)).pipe(
+				Effect.provideService(References.MinimumLogLevel, "None"),
+			),
+		)
+
+		const [oldOperation, staleAttribute, staleAiText, stalePrompt, freshAttribute] = await storeRuntime.runPromise(
+			Effect.flatMap(TelemetryStore, (store) =>
+				Effect.all([
+					store.searchSpans({ serviceName: "reingest-api", operation: "reingest.old" }),
+					store.searchSpans({ serviceName: "reingest-api", attributeFilters: { stale: "old" } }),
+					store.searchTraceSummaries({ serviceName: "reingest-api", aiText: "orphaned stale" }),
+					store.searchTraceSummaries({ serviceName: "reingest-api", aiText: "still indexed stale" }),
+					store.searchSpans({ serviceName: "reingest-api", operation: "reingest.new", attributeFilters: { fresh: "new" } }),
+				]),
+			).pipe(Effect.provideService(References.MinimumLogLevel, "None")),
+		)
+
+		expect(oldOperation).toHaveLength(0)
+		expect(staleAttribute).toHaveLength(0)
+		expect(staleAiText).toHaveLength(0)
+		expect(stalePrompt).toHaveLength(0)
+		expect(freshAttribute).toHaveLength(1)
+		expect(freshAttribute[0]?.span.operationName).toBe("reingest.new")
 	})
 
 	it("documents the AI routes in OpenAPI", () => {

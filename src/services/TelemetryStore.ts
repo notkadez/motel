@@ -4,7 +4,7 @@ import { dirname } from "node:path"
 import { Clock, Effect, Layer, Schedule, Context } from "effect"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
-import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
+import { AI_ATTR_MAP, AI_FTS_KEYS, truncatePreview } from "../domain.js"
 import { attributeMap, nanosToMilliseconds, parseAnyValue, spanKindLabel, spanStatusLabel, stringifyValue, type OtlpLogExportRequest, type OtlpTraceExportRequest } from "../otlp.js"
 
 const isSqliteLockError = (error: unknown) =>
@@ -154,6 +154,207 @@ interface TraceSummaryRow {
 
 type InternalTraceSpanItem = TraceSpanItem & {
 	readonly syntheticMissingParent?: boolean
+}
+
+type SpanKey = readonly [traceId: string, spanId: string]
+type SpanOperation = readonly [traceId: string, spanId: string, operationName: string]
+type SpanOperationFtsRow = readonly [rowid: number, traceId: string, spanId: string, operationName: string]
+type SpanOperationIndexRow = readonly [traceId: string, spanId: string, ftsRowid: number]
+type SpanAttributeRow = readonly [traceId: string, spanId: string, key: string, value: string]
+
+const AI_FTS_KEY_SET = new Set<string>(AI_FTS_KEYS)
+const AI_FTS_KEY_SQL = AI_FTS_KEYS.map((key) => `'${key.replace(/'/g, "''")}'`).join(", ")
+const spanKeyOf = (traceId: string, spanId: string) => `${traceId}\u0000${spanId}`
+
+const SEARCH_INDEX_NAMES = ["spanOperation", "aiText", "logBody"] as const
+type SearchIndexName = typeof SEARCH_INDEX_NAMES[number]
+type SearchIndexSpec = {
+	readonly metaKey: string
+	readonly version: string
+	readonly tables: readonly string[]
+}
+
+const SEARCH_INDEX_SPECS: Record<SearchIndexName, SearchIndexSpec> = {
+	spanOperation: {
+		metaKey: "span_operation_search_index",
+		version: "rowid-v1",
+		tables: ["span_operation_fts", "span_operation_index"],
+	},
+	aiText: {
+		metaKey: "ai_text_search_index",
+		version: `keys:${AI_FTS_KEYS.join("\n")}`,
+		tables: ["span_attr_fts", "span_attr_fts_index"],
+	},
+	logBody: {
+		metaKey: "log_body_search_index",
+		version: "rowid-v1",
+		tables: ["log_body_fts"],
+	},
+}
+
+const ensureTelemetryStoreMeta = (db: Database) => {
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS telemetry_store_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+	`)
+}
+
+const readMetaValue = (db: Database, key: string) =>
+	(db.query(`SELECT value FROM telemetry_store_meta WHERE key = ?`).get(key) as { value: string } | null)?.value ?? null
+
+const writeMetaValue = (db: Database, key: string, value: string) => {
+	db.query(`INSERT OR REPLACE INTO telemetry_store_meta(key, value) VALUES (?, ?)`).run(key, value)
+}
+
+const hasCurrentSearchIndex = (db: Database, key: string, version: string) =>
+	readMetaValue(db, key) === version
+
+const hasCurrentNamedSearchIndex = (db: Database, name: SearchIndexName) => {
+	const spec = SEARCH_INDEX_SPECS[name]
+	return hasCurrentSearchIndex(db, spec.metaKey, spec.version)
+}
+
+const searchIndexTablesExist = (db: Database, name: SearchIndexName) => {
+	const tableExists = db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`)
+	return SEARCH_INDEX_SPECS[name].tables.every((table) => tableExists.get(table) !== null)
+}
+
+const createSpanOperationSearchIndexSchema = (db: Database) => {
+	db.exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS span_operation_fts USING fts5(
+			trace_id UNINDEXED,
+			span_id UNINDEXED,
+			operation_name,
+			tokenize='unicode61'
+		);
+
+		CREATE TABLE IF NOT EXISTS span_operation_index (
+			trace_id TEXT NOT NULL,
+			span_id TEXT NOT NULL,
+			fts_rowid INTEGER NOT NULL,
+			PRIMARY KEY (trace_id, span_id)
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_span_operation_index_fts_rowid
+			ON span_operation_index(fts_rowid);
+	`)
+}
+
+const createAiTextSearchIndexSchema = (db: Database) => {
+	// External-content FTS5 over the subset of span_attributes.value rows
+	// whose key is in AI_FTS_KEYS. The value text itself continues to live
+	// once in span_attributes; ingest maintains the inverted index and the
+	// rowid side table in batches.
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS span_attr_fts_index (
+			rowid INTEGER PRIMARY KEY
+		);
+
+		DROP TRIGGER IF EXISTS span_attr_fts_ai;
+		DROP TRIGGER IF EXISTS span_attr_fts_ad;
+		DROP TRIGGER IF EXISTS span_attr_fts_au;
+
+		CREATE VIRTUAL TABLE IF NOT EXISTS span_attr_fts USING fts5(
+			value,
+			content='span_attributes',
+			content_rowid='rowid',
+			tokenize='unicode61 remove_diacritics 2'
+		);
+	`)
+}
+
+const createLogBodySearchIndexSchema = (db: Database) => {
+	db.exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS log_body_fts USING fts5(
+			log_id UNINDEXED,
+			body,
+			tokenize='unicode61'
+		);
+	`)
+}
+
+const rebuildSpanOperationSearchIndex = (db: Database) => {
+	createSpanOperationSearchIndexSchema(db)
+	ensureTelemetryStoreMeta(db)
+
+	if (hasCurrentNamedSearchIndex(db, "spanOperation")) return
+
+	db.transaction(() => {
+		db.exec(`DELETE FROM span_operation_index`)
+		db.exec(`DELETE FROM span_operation_fts`)
+		db.exec(`
+			INSERT INTO span_operation_fts(rowid, trace_id, span_id, operation_name)
+			SELECT rowid, trace_id, span_id, operation_name
+			FROM spans
+		`)
+		db.exec(`
+			INSERT OR REPLACE INTO span_operation_index(trace_id, span_id, fts_rowid)
+			SELECT trace_id, span_id, rowid
+			FROM spans
+		`)
+		const spec = SEARCH_INDEX_SPECS.spanOperation
+		writeMetaValue(db, spec.metaKey, spec.version)
+	})()
+}
+
+const rebuildAiTextSearchIndex = (db: Database) => {
+	createAiTextSearchIndexSchema(db)
+	ensureTelemetryStoreMeta(db)
+
+	if (hasCurrentNamedSearchIndex(db, "aiText")) return
+
+	db.transaction(() => {
+		db.exec(`
+			DROP TABLE IF EXISTS span_attr_fts;
+
+			CREATE VIRTUAL TABLE span_attr_fts USING fts5(
+				value,
+				content='span_attributes',
+				content_rowid='rowid',
+				tokenize='unicode61 remove_diacritics 2'
+			);
+
+			DELETE FROM span_attr_fts_index;
+
+			INSERT INTO span_attr_fts(rowid, value)
+			SELECT rowid, value
+			FROM span_attributes
+			WHERE key IN (${AI_FTS_KEY_SQL});
+
+			INSERT OR IGNORE INTO span_attr_fts_index(rowid)
+			SELECT rowid
+			FROM span_attributes
+			WHERE key IN (${AI_FTS_KEY_SQL});
+		`)
+		const spec = SEARCH_INDEX_SPECS.aiText
+		writeMetaValue(db, spec.metaKey, spec.version)
+	})()
+}
+
+const rebuildLogBodySearchIndex = (db: Database) => {
+	createLogBodySearchIndexSchema(db)
+	ensureTelemetryStoreMeta(db)
+
+	if (hasCurrentNamedSearchIndex(db, "logBody")) return
+
+	db.transaction(() => {
+		db.exec(`DELETE FROM log_body_fts`)
+		db.exec(`
+			INSERT INTO log_body_fts(log_id, body)
+			SELECT id, body
+			FROM logs
+		`)
+		const spec = SEARCH_INDEX_SPECS.logBody
+		writeMetaValue(db, spec.metaKey, spec.version)
+	})()
+}
+
+export const repairTelemetrySearchIndexes = (db: Database) => {
+	rebuildSpanOperationSearchIndex(db)
+	rebuildAiTextSearchIndex(db)
+	rebuildLogBodySearchIndex(db)
 }
 
 const isSpanRunning = (startTimeMs: number, endTimeMs: number) => endTimeMs <= 0 || endTimeMs < startTimeMs
@@ -383,6 +584,118 @@ const toFtsMatchQuery = (value: string) => {
 	return tokens.map((token) => `${token}*`).join(" AND ")
 }
 
+type SqlFilter = {
+	readonly sql: string
+	readonly params: readonly (string | number)[]
+}
+
+type SqlJoinFilter = SqlFilter & {
+	readonly joinSql: string
+}
+
+const buildSpanOperationTraceFilter = (operation: string, useSearchIndex: boolean): SqlFilter => {
+	const ftsQuery = toFtsMatchQuery(operation)
+	if (useSearchIndex && ftsQuery) {
+		return {
+			sql: `trace_id IN (
+				SELECT DISTINCT soi.trace_id
+				FROM span_operation_fts
+				JOIN span_operation_index AS soi ON soi.fts_rowid = span_operation_fts.rowid
+				JOIN spans AS s ON s.trace_id = soi.trace_id AND s.span_id = soi.span_id
+				WHERE span_operation_fts MATCH ?
+			)`,
+			params: [ftsQuery],
+		}
+	}
+
+	return {
+		sql: "trace_id IN (SELECT DISTINCT trace_id FROM spans WHERE operation_name LIKE ? COLLATE NOCASE)",
+		params: [`%${operation}%`],
+	}
+}
+
+const buildSpanOperationJoinFilter = (operation: string, useSearchIndex: boolean): SqlJoinFilter => {
+	const ftsQuery = toFtsMatchQuery(operation)
+	if (useSearchIndex && ftsQuery) {
+		return {
+			joinSql: `INNER JOIN (
+				SELECT soi.trace_id, soi.span_id
+				FROM span_operation_fts
+				JOIN span_operation_index AS soi ON soi.fts_rowid = span_operation_fts.rowid
+				WHERE span_operation_fts MATCH ?
+				-- Prevent SQLite from flattening this into a spans-first plan.
+				LIMIT -1
+			) AS span_operation_match ON span_operation_match.trace_id = s.trace_id AND span_operation_match.span_id = s.span_id`,
+			sql: "",
+			params: [ftsQuery],
+		}
+	}
+
+	return {
+		joinSql: "",
+		sql: "s.operation_name LIKE ? COLLATE NOCASE",
+		params: [`%${operation}%`],
+	}
+}
+
+const buildAiTextTraceFilter = (text: string, useSearchIndex: boolean): SqlFilter | null => {
+	const ftsQuery = toFtsMatchQuery(text)
+	if (!ftsQuery) return null
+
+	if (useSearchIndex) {
+		return {
+			sql: `trace_id IN (
+				SELECT DISTINCT sa.trace_id
+				FROM span_attr_fts fts
+				JOIN span_attributes sa ON sa.rowid = fts.rowid
+				WHERE fts.value MATCH ?
+			)`,
+			params: [ftsQuery],
+		}
+	}
+
+	const textKeys = AI_FTS_KEYS.map(() => "?").join(", ")
+	return {
+		sql: `trace_id IN (
+			SELECT DISTINCT trace_id
+			FROM span_attributes
+			WHERE key IN (${textKeys})
+				AND value LIKE ? COLLATE NOCASE
+		)`,
+		params: [...AI_FTS_KEYS, `%${text}%`],
+	}
+}
+
+const buildAiTextSpanFilter = (text: string, spanAlias: string, useSearchIndex: boolean): SqlFilter | null => {
+	const ftsQuery = toFtsMatchQuery(text)
+	if (!ftsQuery) return null
+
+	if (useSearchIndex) {
+		return {
+			sql: `EXISTS (
+				SELECT 1 FROM span_attr_fts fts
+				JOIN span_attributes sa ON sa.rowid = fts.rowid
+				WHERE sa.trace_id = ${spanAlias}.trace_id
+				AND sa.span_id = ${spanAlias}.span_id
+				AND fts.value MATCH ?
+			)`,
+			params: [ftsQuery],
+		}
+	}
+
+	const textKeys = AI_FTS_KEYS.map(() => "?").join(", ")
+	return {
+		sql: `EXISTS (
+			SELECT 1 FROM span_attributes
+			WHERE span_attributes.trace_id = ${spanAlias}.trace_id
+			AND span_attributes.span_id = ${spanAlias}.span_id
+			AND key IN (${textKeys})
+			AND value LIKE ? COLLATE NOCASE
+		)`,
+		params: [...AI_FTS_KEYS, `%${text}%`],
+	}
+}
+
 const buildExactAttributeMatchSubquery = (
 	tableName: "span_attributes" | "log_attributes",
 	idColumns: readonly string[],
@@ -468,6 +781,62 @@ export class TelemetryStore extends Context.Service<
 export interface TelemetryStoreOptions {
 	readonly readonly: boolean
 	readonly runRetention: boolean
+}
+
+const databaseHasSearchIndexSourceRows = (db: Database) => {
+	try {
+		return db.query(`SELECT 1 FROM spans LIMIT 1`).get() !== null
+			|| db.query(`SELECT 1 FROM span_attributes WHERE key IN (${AI_FTS_KEY_SQL}) LIMIT 1`).get() !== null
+			|| db.query(`SELECT 1 FROM logs LIMIT 1`).get() !== null
+	} catch {
+		return true
+	}
+}
+
+const createSearchIndexReadiness = (db: Database) => {
+	const state = Object.fromEntries(
+		SEARCH_INDEX_NAMES.map((name) => [name, { tablesReady: false, current: false }]),
+	) as Record<SearchIndexName, { tablesReady: boolean; current: boolean }>
+
+	const refresh = (name: SearchIndexName) => {
+		if (!state[name].tablesReady) {
+			try {
+				state[name].tablesReady = searchIndexTablesExist(db, name)
+			} catch {
+				state[name].tablesReady = false
+			}
+		}
+		if (!state[name].tablesReady) {
+			state[name].current = false
+			return false
+		}
+		try {
+			state[name].current = hasCurrentNamedSearchIndex(db, name)
+		} catch {
+			state[name].current = false
+		}
+		return state[name].current
+	}
+
+	const ready = (name: SearchIndexName) => state[name].current || refresh(name)
+
+	return {
+		markSchemasReady: () => {
+			for (const name of SEARCH_INDEX_NAMES) state[name].tablesReady = true
+		},
+		markUnavailable: () => {
+			for (const name of SEARCH_INDEX_NAMES) {
+				state[name].tablesReady = false
+				state[name].current = false
+			}
+		},
+		refresh,
+		refreshAll: () => {
+			for (const name of SEARCH_INDEX_NAMES) refresh(name)
+		},
+		ready,
+		needsRepair: () => SEARCH_INDEX_NAMES.some((name) => state[name].tablesReady && !ready(name)),
+	}
 }
 
 export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.effect(
@@ -627,126 +996,51 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			}
 		}
 
-		// Tables detected at runtime. For writer connections these flags are
-		// set by the FTS `CREATE VIRTUAL TABLE IF NOT EXISTS` try/catch; for
-		// readonly connections we probe `sqlite_master` and set them based on
-		// what the writer has already provisioned.
-		let hasFts = true
-		let hasAttrFts = true
-		if (opts.readonly) {
-			try {
-				const row = db.query(`SELECT name FROM sqlite_master WHERE type='table' AND name='span_operation_fts'`).get()
-				hasFts = row !== null
-			} catch { hasFts = false }
-			try {
-				const row = db.query(`SELECT name FROM sqlite_master WHERE type='table' AND name='span_attr_fts'`).get()
-				hasAttrFts = row !== null
-			} catch { hasAttrFts = false }
-		}
+		// Search indexes are optional at query time: readonly handles can open
+		// before the writer has repaired them, and SQLite builds without FTS5
+		// still need LIKE fallbacks. All FTS use goes through this marker gate
+		// so queries never trust stale rows from an older index shape.
+		const searchIndexes = createSearchIndexReadiness(db)
+
+		if (opts.readonly) searchIndexes.refreshAll()
 
 		if (!opts.readonly) {
-		try {
-			db.exec(`
-				CREATE VIRTUAL TABLE IF NOT EXISTS span_operation_fts USING fts5(
-					trace_id UNINDEXED,
-					span_id UNINDEXED,
-					operation_name,
-					tokenize='unicode61'
-				);
-
-				CREATE VIRTUAL TABLE IF NOT EXISTS log_body_fts USING fts5(
-					log_id UNINDEXED,
-					body,
-					tokenize='unicode61'
-				);
-			`)
-		} catch {
-			hasFts = false
-			// FTS is optional; queries will fall back to LIKE if unavailable.
-		}
-
-		// External-content FTS5 over the subset of span_attributes.value rows
-		// whose key is in AI_FTS_KEYS (LLM prompts, responses, tool calls,
-		// etc.). External content means the inverted index is the only
-		// FTS storage — the value text itself continues to live once in
-		// span_attributes, not duplicated into the FTS table. On a 2 GB DB
-		// with 270 MB of prompt JSON this typically adds ~50-120 MB of
-		// index, turning a 500-800ms LIKE scan into a <50ms MATCH.
-		//
-		// Keys are inlined into the trigger DDL rather than looked up in a
-		// side table so the `WHEN` guard stays constant-cost (a subquery
-		// would run on every span_attributes insert — ~60/span).
-		if (hasFts) {
 			try {
-				const keyList = AI_FTS_KEYS.map((k) => `'${k.replace(/'/g, "''")}'`).join(", ")
-				db.exec(`
-					CREATE VIRTUAL TABLE IF NOT EXISTS span_attr_fts USING fts5(
-						value,
-						content='span_attributes',
-						content_rowid='rowid',
-						tokenize='unicode61 remove_diacritics 2'
-					);
-
-					-- Mirror inserts into FTS when the key carries LLM content.
-					-- NOTE: triggers MUST use fully-qualified name (new.rowid,
-					-- new.value) and emit rowid so external-content FTS can
-					-- fetch the value back via span_attributes.rowid.
-					CREATE TRIGGER IF NOT EXISTS span_attr_fts_ai AFTER INSERT ON span_attributes
-					WHEN new.key IN (${keyList})
-					BEGIN
-						INSERT INTO span_attr_fts(rowid, value) VALUES (new.rowid, new.value);
-					END;
-
-					-- Delete with the same guard so retention & re-ingest stay
-					-- in sync. External-content 'delete' command needs the
-					-- original value to remove from the inverted index.
-					CREATE TRIGGER IF NOT EXISTS span_attr_fts_ad AFTER DELETE ON span_attributes
-					WHEN old.key IN (${keyList})
-					BEGIN
-						INSERT INTO span_attr_fts(span_attr_fts, rowid, value)
-						VALUES ('delete', old.rowid, old.value);
-					END;
-
-					-- Handle in-place updates (rare; re-ingest usually goes
-					-- DELETE then INSERT but belt-and-braces).
-					CREATE TRIGGER IF NOT EXISTS span_attr_fts_au AFTER UPDATE ON span_attributes
-					WHEN old.key IN (${keyList}) OR new.key IN (${keyList})
-					BEGIN
-						INSERT INTO span_attr_fts(span_attr_fts, rowid, value)
-						VALUES ('delete', old.rowid, old.value);
-						INSERT INTO span_attr_fts(rowid, value)
-						SELECT new.rowid, new.value
-						WHERE new.key IN (${keyList});
-					END;
-				`)
+				createSpanOperationSearchIndexSchema(db)
+				ensureTelemetryStoreMeta(db)
+				createAiTextSearchIndexSchema(db)
+				createLogBodySearchIndexSchema(db)
+				searchIndexes.markSchemasReady()
+				if (!databaseHasSearchIndexSourceRows(db)) repairTelemetrySearchIndexes(db)
+				searchIndexes.refreshAll()
 			} catch {
-				hasAttrFts = false
+				searchIndexes.markUnavailable()
+				// FTS is optional; queries will fall back to LIKE if unavailable.
 			}
-		}
 
-		try {
-			db.exec(`ALTER TABLE trace_summaries ADD COLUMN active_span_count INTEGER NOT NULL DEFAULT 0`)
-		} catch {
-			// Existing databases may already have the column.
-		}
+			try {
+				db.exec(`ALTER TABLE trace_summaries ADD COLUMN active_span_count INTEGER NOT NULL DEFAULT 0`)
+			} catch {
+				// Existing databases may already have the column.
+			}
 
-		// Prime the query planner. `PRAGMA optimize` is SQLite's modern,
-		// lightweight stats refresh: it only re-ANALYZEs indexes whose row
-		// counts have drifted significantly since the last run, capped at
-		// `analysis_limit` iterations per index so it finishes in a
-		// bounded time even on large databases. Without this, queries like
-		// the attribute picker facet run with guessed row estimates and
-		// pay 3-4s on cold open instead of 400ms.
-		try {
-			db.exec(`PRAGMA analysis_limit = 1000; PRAGMA optimize;`)
-			// First-time databases won't have sqlite_stat1 until we run a
-			// real ANALYZE. Force it once if stats haven't been collected.
-			const hasStats = db.query(`SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1' LIMIT 1`).get() !== null
-			if (!hasStats) db.exec(`ANALYZE;`)
-		} catch {
-			// ANALYZE / optimize failures are never fatal — queries still work,
-			// they just run with default row estimates.
-		}
+			// Prime the query planner. `PRAGMA optimize` is SQLite's modern,
+			// lightweight stats refresh: it only re-ANALYZEs indexes whose row
+			// counts have drifted significantly since the last run, capped at
+			// `analysis_limit` iterations per index so it finishes in a
+			// bounded time even on large databases. Without this, queries like
+			// the attribute picker facet run with guessed row estimates and
+			// pay 3-4s on cold open instead of 400ms.
+			try {
+				db.exec(`PRAGMA analysis_limit = 1000; PRAGMA optimize;`)
+				// First-time databases won't have sqlite_stat1 until we run a
+				// real ANALYZE. Force it once if stats haven't been collected.
+				const hasStats = db.query(`SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1' LIMIT 1`).get() !== null
+				if (!hasStats) db.exec(`ANALYZE;`)
+			} catch {
+				// ANALYZE / optimize failures are never fatal — queries still work,
+				// they just run with default row estimates.
+			}
 			// Longer busy timeout: the ingest worker holds the write lock for up
 			// to a few seconds during big OTLP batches, and the daemon's retention
 			// passes can do the same. Apply this AFTER startup maintenance so
@@ -754,6 +1048,40 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			// for the full 15s timeout.
 			try { db.exec(`PRAGMA busy_timeout = 15000;`) } catch { /* ignore */ }
 		} // end: if (!opts.readonly) writer init
+
+		const spanOperationSearchReady = () => searchIndexes.ready("spanOperation")
+		const aiTextSearchReady = () => searchIndexes.ready("aiText")
+		const logBodySearchReady = () => searchIndexes.ready("logBody")
+
+		if (!opts.readonly && searchIndexes.needsRepair()) {
+			yield* Effect.acquireRelease(
+				Effect.sync(() => {
+					// Large existing DBs can take seconds to rebuild FTS indexes.
+					// Run the repair in a one-shot worker so the daemon/API event
+					// loop stays responsive and queries use SQL fallbacks until the
+					// marker lands.
+					const worker = new Worker(new URL("./searchIndexRepairWorker.ts", import.meta.url))
+					worker.addEventListener("message", (event) => {
+						const data = event.data as { readonly type?: string; readonly message?: string }
+						if (data.type === "done") {
+							searchIndexes.refreshAll()
+						} else if (data.type === "error" && data.message) {
+							console.warn(`motel: search index repair failed: ${data.message}`)
+						}
+						worker.terminate()
+					})
+					worker.addEventListener("error", (event) => {
+						console.warn(`motel: search index repair worker failed: ${event.message}`)
+						worker.terminate()
+					})
+					worker.postMessage({ databasePath: config.otel.databasePath })
+					return worker
+				}),
+				(worker) => Effect.sync(() => {
+					worker.terminate()
+				}),
+			)
+		}
 
 		const insertSpan = db.query(`
 			INSERT INTO spans (
@@ -812,49 +1140,346 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		})
 
 		const deleteSpanAttributes = db.query(`DELETE FROM span_attributes WHERE trace_id = ? AND span_id = ?`)
+		const deleteSpanAttributesManyByCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanAttributesMany = (keys: readonly SpanKey[]) => {
+			if (keys.length === 0) return
+			if (keys.length === 1) {
+				const [traceId, spanId] = keys[0]!
+				deleteSpanAttributes.run(traceId, spanId)
+				return
+			}
+
+			const BATCH_SIZE = 1000
+			for (let offset = 0; offset < keys.length; offset += BATCH_SIZE) {
+				const batch = keys.slice(offset, offset + BATCH_SIZE)
+				let query = deleteSpanAttributesManyByCount.get(batch.length)
+				if (!query) {
+					query = db.query(`
+						DELETE FROM span_attributes
+						WHERE (trace_id, span_id) IN (VALUES ${batch.map(() => "(?, ?)").join(", ")})
+					`)
+					deleteSpanAttributesManyByCount.set(batch.length, query)
+				}
+				query.run(...batch.flat())
+			}
+		}
+
 		const insertSpanAttribute = db.query(`INSERT INTO span_attributes (trace_id, span_id, key, value) VALUES (?, ?, ?, ?)`)
-		const spanAttributeInsertManyByCount = new Map<number, ReturnType<Database["query"]>>()
-		const insertSpanAttributesMany = (traceId: string, spanId: string, attributes: Readonly<Record<string, string>>) => {
-			const entries = Object.entries(attributes)
-			if (entries.length === 0) return
-			if (entries.length === 1) {
-				const [key, value] = entries[0]!
+		const insertSpanAttributeRowsManyByCount = new Map<number, ReturnType<Database["query"]>>()
+		const insertSpanAttributeRowsMany = (rows: readonly SpanAttributeRow[]) => {
+			if (rows.length === 0) return
+			if (rows.length === 1) {
+				const [traceId, spanId, key, value] = rows[0]!
 				insertSpanAttribute.run(traceId, spanId, key, value)
 				return
 			}
-			let query = spanAttributeInsertManyByCount.get(entries.length)
-			if (!query) {
-				query = db.query(`INSERT INTO span_attributes (trace_id, span_id, key, value) VALUES ${entries.map(() => "(?, ?, ?, ?)").join(", ")}`)
-				spanAttributeInsertManyByCount.set(entries.length, query)
+
+			const BATCH_SIZE = 5000
+			for (let offset = 0; offset < rows.length; offset += BATCH_SIZE) {
+				const batch = rows.slice(offset, offset + BATCH_SIZE)
+				let query = insertSpanAttributeRowsManyByCount.get(batch.length)
+				if (!query) {
+					query = db.query(`INSERT INTO span_attributes (trace_id, span_id, key, value) VALUES ${batch.map(() => "(?, ?, ?, ?)").join(", ")}`)
+					insertSpanAttributeRowsManyByCount.set(batch.length, query)
+				}
+				query.run(...batch.flat())
 			}
-			query.run(...entries.flatMap(([key, value]) => [traceId, spanId, key, value]))
 		}
-		const deleteSpanOperationSearch = db.query(`DELETE FROM span_operation_fts WHERE trace_id = ? AND span_id = ?`)
-		const insertSpanOperationSearch = db.query(`INSERT INTO span_operation_fts (trace_id, span_id, operation_name) VALUES (?, ?, ?)`)
-		const deleteSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
-		const insertSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
-		const updateSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
-			if (operations.length === 0) return
-			if (operations.length === 1) {
-				const [traceId, spanId, operationName] = operations[0]!
-				deleteSpanOperationSearch.run(traceId, spanId)
-				insertSpanOperationSearch.run(traceId, spanId, operationName)
-				return
+
+		const spanKeyValuesSql = (count: number) => `VALUES ${Array.from({ length: count }, () => "(?, ?)").join(", ")}`
+		const traceIdValuesSql = (count: number) => `VALUES ${Array.from({ length: count }, () => "(?)").join(", ")}`
+
+		const deleteSpanAttributeFtsRowsBySpanKeyCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanAttributeFtsIndexBySpanKeyCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanAttributeFtsRowsBySpanKeys = (keys: readonly SpanKey[]) => {
+			if (!aiTextSearchReady() || keys.length === 0) return
+
+			const BATCH_SIZE = 400
+			for (let offset = 0; offset < keys.length; offset += BATCH_SIZE) {
+				const batch = keys.slice(offset, offset + BATCH_SIZE)
+				let deleteFtsQuery = deleteSpanAttributeFtsRowsBySpanKeyCount.get(batch.length)
+				if (!deleteFtsQuery) {
+					const touchedSpans = spanKeyValuesSql(batch.length)
+					deleteFtsQuery = db.query(`
+						WITH touched(trace_id, span_id) AS (${touchedSpans})
+						INSERT INTO span_attr_fts(span_attr_fts, rowid, value)
+						SELECT 'delete', sa.rowid, sa.value
+						FROM touched
+						JOIN span_attributes AS sa
+							ON sa.trace_id = touched.trace_id
+							AND sa.span_id = touched.span_id
+						JOIN span_attr_fts_index AS indexed
+							ON indexed.rowid = sa.rowid
+						WHERE sa.key IN (${AI_FTS_KEY_SQL})
+					`)
+					deleteSpanAttributeFtsRowsBySpanKeyCount.set(batch.length, deleteFtsQuery)
+				}
+				deleteFtsQuery.run(...batch.flat())
+
+				let deleteIndexQuery = deleteSpanAttributeFtsIndexBySpanKeyCount.get(batch.length)
+				if (!deleteIndexQuery) {
+					const touchedSpans = spanKeyValuesSql(batch.length)
+					deleteIndexQuery = db.query(`
+						WITH touched(trace_id, span_id) AS (${touchedSpans})
+						DELETE FROM span_attr_fts_index
+						WHERE rowid IN (
+							SELECT sa.rowid
+							FROM touched
+							JOIN span_attributes AS sa
+								ON sa.trace_id = touched.trace_id
+								AND sa.span_id = touched.span_id
+							WHERE sa.key IN (${AI_FTS_KEY_SQL})
+						)
+					`)
+					deleteSpanAttributeFtsIndexBySpanKeyCount.set(batch.length, deleteIndexQuery)
+				}
+				deleteIndexQuery.run(...batch.flat())
+			}
+		}
+
+		const deleteSpanAttributeFtsRowsByTraceIdCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanAttributeFtsIndexByTraceIdCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanAttributeFtsRowsByTraceIds = (traceIds: readonly string[]) => {
+			if (!aiTextSearchReady() || traceIds.length === 0) return
+
+			const BATCH_SIZE = 500
+			for (let offset = 0; offset < traceIds.length; offset += BATCH_SIZE) {
+				const batch = traceIds.slice(offset, offset + BATCH_SIZE)
+				let deleteFtsQuery = deleteSpanAttributeFtsRowsByTraceIdCount.get(batch.length)
+				if (!deleteFtsQuery) {
+					const touchedTraces = traceIdValuesSql(batch.length)
+					deleteFtsQuery = db.query(`
+						WITH touched(trace_id) AS (${touchedTraces})
+						INSERT INTO span_attr_fts(span_attr_fts, rowid, value)
+						SELECT 'delete', sa.rowid, sa.value
+						FROM touched
+						JOIN span_attributes AS sa
+							ON sa.trace_id = touched.trace_id
+						JOIN span_attr_fts_index AS indexed
+							ON indexed.rowid = sa.rowid
+						WHERE sa.key IN (${AI_FTS_KEY_SQL})
+					`)
+					deleteSpanAttributeFtsRowsByTraceIdCount.set(batch.length, deleteFtsQuery)
+				}
+				deleteFtsQuery.run(...batch)
+
+				let deleteIndexQuery = deleteSpanAttributeFtsIndexByTraceIdCount.get(batch.length)
+				if (!deleteIndexQuery) {
+					const touchedTraces = traceIdValuesSql(batch.length)
+					deleteIndexQuery = db.query(`
+						WITH touched(trace_id) AS (${touchedTraces})
+						DELETE FROM span_attr_fts_index
+						WHERE rowid IN (
+							SELECT sa.rowid
+							FROM touched
+							JOIN span_attributes AS sa
+								ON sa.trace_id = touched.trace_id
+							WHERE sa.key IN (${AI_FTS_KEY_SQL})
+						)
+					`)
+					deleteSpanAttributeFtsIndexByTraceIdCount.set(batch.length, deleteIndexQuery)
+				}
+				deleteIndexQuery.run(...batch)
+			}
+		}
+
+		const insertSpanAttributeFtsRowsBySpanKeyCount = new Map<number, ReturnType<Database["query"]>>()
+		const insertSpanAttributeFtsIndexBySpanKeyCount = new Map<number, ReturnType<Database["query"]>>()
+		const insertSpanAttributeFtsRowsBySpanKeys = (keys: readonly SpanKey[]) => {
+			if (!aiTextSearchReady() || keys.length === 0) return
+
+			const BATCH_SIZE = 400
+			for (let offset = 0; offset < keys.length; offset += BATCH_SIZE) {
+				const batch = keys.slice(offset, offset + BATCH_SIZE)
+				let insertFtsQuery = insertSpanAttributeFtsRowsBySpanKeyCount.get(batch.length)
+				if (!insertFtsQuery) {
+					const touchedSpans = spanKeyValuesSql(batch.length)
+					insertFtsQuery = db.query(`
+						WITH touched(trace_id, span_id) AS (${touchedSpans})
+						INSERT INTO span_attr_fts(rowid, value)
+						SELECT sa.rowid, sa.value
+						FROM touched
+						JOIN span_attributes AS sa
+							ON sa.trace_id = touched.trace_id
+							AND sa.span_id = touched.span_id
+						WHERE sa.key IN (${AI_FTS_KEY_SQL})
+					`)
+					insertSpanAttributeFtsRowsBySpanKeyCount.set(batch.length, insertFtsQuery)
+				}
+				insertFtsQuery.run(...batch.flat())
+
+				let insertIndexQuery = insertSpanAttributeFtsIndexBySpanKeyCount.get(batch.length)
+				if (!insertIndexQuery) {
+					const touchedSpans = spanKeyValuesSql(batch.length)
+					insertIndexQuery = db.query(`
+						WITH touched(trace_id, span_id) AS (${touchedSpans})
+						INSERT OR IGNORE INTO span_attr_fts_index(rowid)
+						SELECT sa.rowid
+						FROM touched
+						JOIN span_attributes AS sa
+							ON sa.trace_id = touched.trace_id
+							AND sa.span_id = touched.span_id
+						WHERE sa.key IN (${AI_FTS_KEY_SQL})
+					`)
+					insertSpanAttributeFtsIndexBySpanKeyCount.set(batch.length, insertIndexQuery)
+				}
+				insertIndexQuery.run(...batch.flat())
+			}
+		}
+
+		const nextSpanOperationFtsRowid = () => {
+			const row = db.query(`SELECT COALESCE(MAX(rowid), 0) + 1 AS rowid FROM span_operation_fts`).get() as { rowid: number }
+			return row.rowid
+		}
+
+		const selectSpanOperationFtsRowidsBySpanKeyCount = new Map<number, ReturnType<Database["query"]>>()
+		const selectSpanOperationFtsRowidsBySpanKeys = (keys: readonly SpanKey[]) => {
+			const rowids: number[] = []
+			if (!spanOperationSearchReady() || keys.length === 0) return rowids
+
+			const BATCH_SIZE = 1000
+			for (let offset = 0; offset < keys.length; offset += BATCH_SIZE) {
+				const batch = keys.slice(offset, offset + BATCH_SIZE)
+				let query = selectSpanOperationFtsRowidsBySpanKeyCount.get(batch.length)
+				if (!query) {
+					query = db.query(`
+						SELECT fts_rowid
+						FROM span_operation_index
+						WHERE (trace_id, span_id) IN (VALUES ${batch.map(() => "(?, ?)").join(", ")})
+					`)
+					selectSpanOperationFtsRowidsBySpanKeyCount.set(batch.length, query)
+				}
+				const rows = query.all(...batch.flat()) as Array<{ fts_rowid: number }>
+				for (const row of rows) rowids.push(row.fts_rowid)
 			}
 
-			let deleteQuery = deleteSpanOperationSearchManyByCount.get(operations.length)
-			if (!deleteQuery) {
-				deleteQuery = db.query(`DELETE FROM span_operation_fts WHERE ${operations.map(() => "(trace_id = ? AND span_id = ?)").join(" OR ")}`)
-				deleteSpanOperationSearchManyByCount.set(operations.length, deleteQuery)
-			}
-			deleteQuery.run(...operations.flatMap(([traceId, spanId]) => [traceId, spanId]))
+			return rowids
+		}
 
-			let insertQuery = insertSpanOperationSearchManyByCount.get(operations.length)
-			if (!insertQuery) {
-				insertQuery = db.query(`INSERT INTO span_operation_fts (trace_id, span_id, operation_name) VALUES ${operations.map(() => "(?, ?, ?)").join(", ")}`)
-				insertSpanOperationSearchManyByCount.set(operations.length, insertQuery)
+		const selectSpanOperationFtsRowidsByTraceIdCount = new Map<number, ReturnType<Database["query"]>>()
+		const selectSpanOperationFtsRowidsByTraceIds = (traceIds: readonly string[]) => {
+			const rowids: number[] = []
+			if (!spanOperationSearchReady() || traceIds.length === 0) return rowids
+
+			const BATCH_SIZE = 500
+			for (let offset = 0; offset < traceIds.length; offset += BATCH_SIZE) {
+				const batch = traceIds.slice(offset, offset + BATCH_SIZE)
+				let query = selectSpanOperationFtsRowidsByTraceIdCount.get(batch.length)
+				if (!query) {
+					query = db.query(`
+						SELECT fts_rowid
+						FROM span_operation_index
+						WHERE trace_id IN (${batch.map(() => "?").join(", ")})
+					`)
+					selectSpanOperationFtsRowidsByTraceIdCount.set(batch.length, query)
+				}
+				const rows = query.all(...batch) as Array<{ fts_rowid: number }>
+				for (const row of rows) rowids.push(row.fts_rowid)
 			}
-			insertQuery.run(...operations.flatMap(([traceId, spanId, operationName]) => [traceId, spanId, operationName]))
+
+			return rowids
+		}
+
+		const deleteSpanOperationSearchRowsByCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanOperationSearchRowsMany = (rowids: readonly number[]) => {
+			if (!spanOperationSearchReady() || rowids.length === 0) return
+
+			const BATCH_SIZE = 1000
+			for (let offset = 0; offset < rowids.length; offset += BATCH_SIZE) {
+				const batch = rowids.slice(offset, offset + BATCH_SIZE)
+				let query = deleteSpanOperationSearchRowsByCount.get(batch.length)
+				if (!query) {
+					query = db.query(`DELETE FROM span_operation_fts WHERE rowid IN (${batch.map(() => "?").join(", ")})`)
+					deleteSpanOperationSearchRowsByCount.set(batch.length, query)
+				}
+				query.run(...batch)
+			}
+		}
+
+		const deleteSpanOperationIndexBySpanKeyCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanOperationIndexMany = (keys: readonly SpanKey[]) => {
+			if (!spanOperationSearchReady() || keys.length === 0) return
+
+			const BATCH_SIZE = 1000
+			for (let offset = 0; offset < keys.length; offset += BATCH_SIZE) {
+				const batch = keys.slice(offset, offset + BATCH_SIZE)
+				let query = deleteSpanOperationIndexBySpanKeyCount.get(batch.length)
+				if (!query) {
+					query = db.query(`
+						DELETE FROM span_operation_index
+						WHERE (trace_id, span_id) IN (VALUES ${batch.map(() => "(?, ?)").join(", ")})
+					`)
+					deleteSpanOperationIndexBySpanKeyCount.set(batch.length, query)
+				}
+				query.run(...batch.flat())
+			}
+		}
+
+		const deleteSpanOperationIndexByTraceIdCount = new Map<number, ReturnType<Database["query"]>>()
+		const deleteSpanOperationIndexByTraceIds = (traceIds: readonly string[]) => {
+			if (!spanOperationSearchReady() || traceIds.length === 0) return
+
+			const BATCH_SIZE = 500
+			for (let offset = 0; offset < traceIds.length; offset += BATCH_SIZE) {
+				const batch = traceIds.slice(offset, offset + BATCH_SIZE)
+				let query = deleteSpanOperationIndexByTraceIdCount.get(batch.length)
+				if (!query) {
+					query = db.query(`DELETE FROM span_operation_index WHERE trace_id IN (${batch.map(() => "?").join(", ")})`)
+					deleteSpanOperationIndexByTraceIdCount.set(batch.length, query)
+				}
+				query.run(...batch)
+			}
+		}
+
+		const insertSpanOperationSearchRowsByCount = new Map<number, ReturnType<Database["query"]>>()
+		const insertSpanOperationSearchRowsMany = (rows: readonly SpanOperationFtsRow[]) => {
+			if (!spanOperationSearchReady() || rows.length === 0) return
+
+			const BATCH_SIZE = 1000
+			for (let offset = 0; offset < rows.length; offset += BATCH_SIZE) {
+				const batch = rows.slice(offset, offset + BATCH_SIZE)
+				let query = insertSpanOperationSearchRowsByCount.get(batch.length)
+				if (!query) {
+					query = db.query(`INSERT INTO span_operation_fts (rowid, trace_id, span_id, operation_name) VALUES ${batch.map(() => "(?, ?, ?, ?)").join(", ")}`)
+					insertSpanOperationSearchRowsByCount.set(batch.length, query)
+				}
+				query.run(...batch.flat())
+			}
+		}
+
+		const insertSpanOperationIndexRowsByCount = new Map<number, ReturnType<Database["query"]>>()
+		const insertSpanOperationIndexRowsMany = (rows: readonly SpanOperationIndexRow[]) => {
+			if (!spanOperationSearchReady() || rows.length === 0) return
+
+			const BATCH_SIZE = 1000
+			for (let offset = 0; offset < rows.length; offset += BATCH_SIZE) {
+				const batch = rows.slice(offset, offset + BATCH_SIZE)
+				let query = insertSpanOperationIndexRowsByCount.get(batch.length)
+				if (!query) {
+					query = db.query(`INSERT INTO span_operation_index (trace_id, span_id, fts_rowid) VALUES ${batch.map(() => "(?, ?, ?)").join(", ")}`)
+					insertSpanOperationIndexRowsByCount.set(batch.length, query)
+				}
+				query.run(...batch.flat())
+			}
+		}
+
+		const updateSpanOperationSearchMany = (operations: readonly SpanOperation[]) => {
+			if (!spanOperationSearchReady() || operations.length === 0) return
+
+			const keys = operations.map(([traceId, spanId]): SpanKey => [traceId, spanId])
+			deleteSpanOperationSearchRowsMany(selectSpanOperationFtsRowidsBySpanKeys(keys))
+			deleteSpanOperationIndexMany(keys)
+
+			let rowid = nextSpanOperationFtsRowid()
+			const ftsRows: SpanOperationFtsRow[] = []
+			const indexRows: SpanOperationIndexRow[] = []
+			for (const [traceId, spanId, operationName] of operations) {
+				ftsRows.push([rowid, traceId, spanId, operationName])
+				indexRows.push([traceId, spanId, rowid])
+				rowid += 1
+			}
+			insertSpanOperationSearchRowsMany(ftsRows)
+			insertSpanOperationIndexRowsMany(indexRows)
 		}
 		const insertLogAttribute = db.query(`INSERT INTO log_attributes (log_id, key, value) VALUES (?, ?, ?)`)
 		const logAttributeInsertManyByCount = new Map<number, ReturnType<Database["query"]>>()
@@ -873,13 +1498,17 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			}
 			query.run(...entries.flatMap(([key, value]) => [logId, key, value]))
 		}
-		const insertLogBodySearch = db.query(`INSERT INTO log_body_fts (log_id, body) VALUES (?, ?)`)
 		const insertLogBodySearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
 		const insertLogBodySearchMany = (entries: ReadonlyArray<readonly [string, string]>) => {
-			if (entries.length === 0) return
+			if (!logBodySearchReady() || entries.length === 0) return
 			if (entries.length === 1) {
 				const [logId, body] = entries[0]!
-				insertLogBodySearch.run(logId, body)
+				let query = insertLogBodySearchManyByCount.get(1)
+				if (!query) {
+					query = db.query(`INSERT INTO log_body_fts (log_id, body) VALUES (?, ?)`)
+					insertLogBodySearchManyByCount.set(1, query)
+				}
+				query.run(logId, body)
 				return
 			}
 			let query = insertLogBodySearchManyByCount.get(entries.length)
@@ -1000,9 +1629,15 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				for (let offset = 0; offset < traceIds.length; offset += BATCH_SIZE) {
 					const batch = traceIds.slice(offset, offset + BATCH_SIZE)
 					const placeholders = batch.map(() => "?").join(",")
+					try {
+						deleteSpanAttributeFtsRowsByTraceIds(batch)
+					} catch {
+						// FTS table may not exist on old DBs.
+					}
 					db.query(`DELETE FROM span_attributes WHERE trace_id IN (${placeholders})`).run(...batch)
 					try {
-						db.query(`DELETE FROM span_operation_fts WHERE trace_id IN (${placeholders})`).run(...batch)
+						deleteSpanOperationSearchRowsMany(selectSpanOperationFtsRowidsByTraceIds(batch))
+						deleteSpanOperationIndexByTraceIds(batch)
 					} catch {
 						// FTS table may not exist on old DBs.
 					}
@@ -1088,86 +1723,110 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			yield* Effect.forkScoped(Effect.repeat(refreshPlannerStats, Schedule.spaced("15 minutes")))
 		}
 
-		// One-time backfill for existing DBs: if span_attr_fts is empty but
-		// span_attributes has rows with AI_FTS_KEYS, populate the index.
-		// Runs forked so server startup isn't blocked; queries hitting the
-		// FTS will just return empty until the fill lands. On a 2 GB DB with
-		// ~400 matching rows this takes ~3-8 seconds. Writer-only because
-		// it does INSERT INTO ... — readonly connections would error.
-		if (hasAttrFts && !opts.readonly) {
-			const backfillAttrFts = Effect.sync(() => {
-				try {
-					const ftsCount = (db.query(`SELECT COUNT(*) AS c FROM span_attr_fts`).get() as { c: number }).c
-					if (ftsCount > 0) return
-					const keyList = AI_FTS_KEYS.map((k) => `'${k.replace(/'/g, "''")}'`).join(", ")
-					const attrCount = (db.query(
-						`SELECT COUNT(*) AS c FROM span_attributes WHERE key IN (${keyList})`,
-					).get() as { c: number }).c
-					if (attrCount === 0) return
-					// Single INSERT..SELECT is atomic and fast; FTS5 batches
-					// its internal segment writes. No transaction wrapper
-					// needed — it runs as one statement.
-					db.exec(`
-						INSERT INTO span_attr_fts(rowid, value)
-						SELECT rowid, value FROM span_attributes WHERE key IN (${keyList})
-					`)
-				} catch {
-					// Backfill failure is never fatal — new ingests still
-					// populate FTS via the trigger, and queries fall back to
-					// LIKE when FTS lookups return empty.
-				}
-			})
-			yield* Effect.forkScoped(backfillAttrFts)
-		}
-
 		const ingestTraces = Effect.fn("motel/TelemetryStore.ingestTraces")(function* (payload: OtlpTraceExportRequest) {
 			return yield* Effect.sync(() => {
 				let insertedSpans = 0
-				const transaction = db.transaction((request: OtlpTraceExportRequest) => {
-					const touchedTraceIds = new Set<string>()
-					const touchedOperations: Array<readonly [string, string, string]> = []
-					for (const resourceSpans of request.resourceSpans ?? []) {
-						const resourceAttributes = attributeMap(resourceSpans.resource?.attributes)
-						const serviceName = resourceAttributes["service.name"] || resourceAttributes["service_name"] || "unknown"
+				const spanWritesByKey = new Map<string, {
+					readonly values: readonly [
+						traceId: string,
+						spanId: string,
+						parentSpanId: string | null,
+						serviceName: string,
+						scopeName: string | null,
+						operationName: string,
+						kind: string | null,
+						startTimeMs: number,
+						endTimeMs: number,
+						durationMs: number,
+						status: "ok" | "error",
+						attributesJson: string,
+						resourceJson: string,
+						eventsJson: string,
+					]
+					readonly attributes: Readonly<Record<string, string>>
+					readonly operation: SpanOperation
+				}>()
+				const touchedTraceIds = new Set<string>()
 
-						for (const scopeSpans of resourceSpans.scopeSpans ?? []) {
-							const scopeName = scopeSpans.scope?.name ?? null
+				for (const resourceSpans of payload.resourceSpans ?? []) {
+					const resourceAttributes = attributeMap(resourceSpans.resource?.attributes)
+					const resourceAttributesJson = JSON.stringify(resourceAttributes)
+					const serviceName = resourceAttributes["service.name"] || resourceAttributes["service_name"] || "unknown"
 
-							for (const span of scopeSpans.spans ?? []) {
-								const spanAttributes = attributeMap(span.attributes)
-								const mergedAttributes = { ...resourceAttributes, ...spanAttributes }
-								const startTimeMs = nanosToMilliseconds(span.startTimeUnixNano)
-								const endTimeMs = nanosToMilliseconds(span.endTimeUnixNano)
-								const events = (span.events ?? []).map((event) => ({
-									name: event.name ?? "event",
-									timestamp: nanosToMilliseconds(event.timeUnixNano),
-									attributes: attributeMap(event.attributes),
-								}))
+					for (const scopeSpans of resourceSpans.scopeSpans ?? []) {
+						const scopeName = scopeSpans.scope?.name ?? null
 
-								insertSpan.run(
-									span.traceId,
-									span.spanId,
+						for (const span of scopeSpans.spans ?? []) {
+							const traceId = span.traceId
+							const spanId = span.spanId
+							const operationName = span.name ?? "unknown"
+							const spanAttributes = attributeMap(span.attributes)
+							const mergedAttributes = { ...resourceAttributes, ...spanAttributes }
+							const startTimeMs = nanosToMilliseconds(span.startTimeUnixNano)
+							const endTimeMs = nanosToMilliseconds(span.endTimeUnixNano)
+							const events = (span.events ?? []).map((event) => ({
+								name: event.name ?? "event",
+								timestamp: nanosToMilliseconds(event.timeUnixNano),
+								attributes: attributeMap(event.attributes),
+							}))
+
+							spanWritesByKey.set(spanKeyOf(traceId, spanId), {
+								values: [
+									traceId,
+									spanId,
 									span.parentSpanId ?? null,
 									serviceName,
 									scopeName,
-									span.name ?? "unknown",
+									operationName,
 									spanKindLabel(span.kind),
 									startTimeMs,
 									endTimeMs,
 									Math.max(0, endTimeMs - startTimeMs),
 									spanStatusLabel(span.status?.code),
 									JSON.stringify(spanAttributes),
-									JSON.stringify(resourceAttributes),
+									resourceAttributesJson,
 									JSON.stringify(events),
-								)
-								deleteSpanAttributes.run(span.traceId, span.spanId)
-								insertSpanAttributesMany(span.traceId, span.spanId, mergedAttributes)
-								touchedOperations.push([span.traceId, span.spanId, span.name ?? "unknown"])
-								touchedTraceIds.add(span.traceId)
-								insertedSpans += 1
-							}
+								],
+								attributes: mergedAttributes,
+								operation: [traceId, spanId, operationName],
+							})
+							touchedTraceIds.add(traceId)
+							insertedSpans += 1
 						}
 					}
+				}
+
+				const transaction = db.transaction(() => {
+					const spanWrites = [...spanWritesByKey.values()]
+					const spanKeys = spanWrites.map((write): SpanKey => [write.values[0], write.values[1]])
+					const touchedOperations: SpanOperation[] = []
+					const attributeRows: SpanAttributeRow[] = []
+					let hasAiAttributeRows = false
+
+					for (const write of spanWrites) {
+						insertSpan.run(...write.values)
+						touchedOperations.push(write.operation)
+						for (const [key, value] of Object.entries(write.attributes)) {
+							attributeRows.push([write.values[0], write.values[1], key, value])
+							hasAiAttributeRows ||= AI_FTS_KEY_SET.has(key)
+						}
+					}
+
+					try {
+						deleteSpanAttributeFtsRowsBySpanKeys(spanKeys)
+					} catch {
+						// FTS is optional.
+					}
+					deleteSpanAttributesMany(spanKeys)
+					insertSpanAttributeRowsMany(attributeRows)
+					if (hasAiAttributeRows) {
+						try {
+							insertSpanAttributeFtsRowsBySpanKeys(spanKeys)
+						} catch {
+							// FTS is optional.
+						}
+					}
+
 					try {
 						const BATCH_SIZE = 500
 						for (let offset = 0; offset < touchedOperations.length; offset += BATCH_SIZE) {
@@ -1181,7 +1840,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					}
 				})
 
-				transaction(payload)
+				transaction()
 				return { insertedSpans }
 			})
 		})
@@ -1333,14 +1992,9 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				}
 
 				if (input.operation) {
-					const ftsQuery = toFtsMatchQuery(input.operation)
-					if (hasFts && ftsQuery) {
-						clauses.push("trace_id IN (SELECT DISTINCT trace_id FROM span_operation_fts WHERE span_operation_fts MATCH ?)")
-						params.push(ftsQuery)
-					} else {
-						clauses.push("trace_id IN (SELECT DISTINCT trace_id FROM spans WHERE operation_name LIKE ? COLLATE NOCASE)")
-						params.push(`%${input.operation}%`)
-					}
+					const operationFilter = buildSpanOperationTraceFilter(input.operation, spanOperationSearchReady())
+					clauses.push(operationFilter.sql)
+					params.push(...operationFilter.params)
 				}
 
 				const exactAttrMatch = buildExactAttributeMatchSubquery("span_attributes", ["trace_id", "span_id"], input.attributeFilters)
@@ -1356,15 +2010,10 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				// stopwords or operator-chars) so users don't get a silently
 				// empty list.
 				if (input.aiText) {
-					const aiFtsQuery = toFtsMatchQuery(input.aiText)
-					if (hasAttrFts && aiFtsQuery) {
-						clauses.push(`trace_id IN (
-							SELECT DISTINCT sa.trace_id
-							FROM span_attr_fts fts
-							JOIN span_attributes sa ON sa.rowid = fts.rowid
-							WHERE fts.value MATCH ?
-						)`)
-						params.push(aiFtsQuery)
+					const aiTextFilter = buildAiTextTraceFilter(input.aiText, aiTextSearchReady())
+					if (aiTextFilter) {
+						clauses.push(aiTextFilter.sql)
+						params.push(...aiTextFilter.params)
 					}
 				}
 
@@ -1465,13 +2114,13 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					params.push(input.serviceName)
 				}
 				if (input.operation) {
-					const ftsQuery = toFtsMatchQuery(input.operation)
-					if (hasFts && ftsQuery) {
-						fromSql += ` INNER JOIN (SELECT trace_id, span_id FROM span_operation_fts WHERE span_operation_fts MATCH ?) AS span_operation_match ON span_operation_match.trace_id = s.trace_id AND span_operation_match.span_id = s.span_id`
-						joinParams.push(ftsQuery)
+					const operationFilter = buildSpanOperationJoinFilter(input.operation, spanOperationSearchReady())
+					if (operationFilter.joinSql) {
+						fromSql += ` ${operationFilter.joinSql}`
+						joinParams.push(...operationFilter.params)
 					} else {
-						clauses.push("s.operation_name LIKE ? COLLATE NOCASE")
-						params.push(`%${input.operation}%`)
+						clauses.push(operationFilter.sql)
+						params.push(...operationFilter.params)
 					}
 				}
 				if (input.status) {
@@ -1616,7 +2265,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				}
 				if (input.body) {
 					const ftsQuery = toFtsMatchQuery(input.body)
-					if (hasFts && ftsQuery) {
+					if (logBodySearchReady() && ftsQuery) {
 						clauses.push(`id IN (SELECT CAST(log_id AS INTEGER) FROM log_body_fts WHERE log_body_fts MATCH ?)`)
 						params.push(ftsQuery)
 					} else {
@@ -2091,20 +2740,10 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			// without FTS still work. FTS turns ~500ms full scans of 3 MB
 			// prompt JSON into <50ms MATCH lookups.
 			if ("text" in input && input.text) {
-				const ftsQuery = toFtsMatchQuery(input.text)
-				if (hasAttrFts && ftsQuery) {
-					clauses.push(`EXISTS (
-						SELECT 1 FROM span_attr_fts fts
-						JOIN span_attributes sa ON sa.rowid = fts.rowid
-						WHERE sa.trace_id = s.trace_id
-						AND sa.span_id = s.span_id
-						AND fts.value MATCH ?
-					)`)
-					params.push(ftsQuery)
-				} else {
-					const textKeys = AI_TEXT_SEARCH_KEYS.map(() => "?").join(", ")
-					clauses.push(`EXISTS (SELECT 1 FROM span_attributes WHERE span_attributes.trace_id = s.trace_id AND span_attributes.span_id = s.span_id AND key IN (${textKeys}) AND value LIKE ? COLLATE NOCASE)`)
-					params.push(...AI_TEXT_SEARCH_KEYS, `%${input.text}%`)
+				const aiTextFilter = buildAiTextSpanFilter(input.text, "s", aiTextSearchReady())
+				if (aiTextFilter) {
+					clauses.push(aiTextFilter.sql)
+					params.push(...aiTextFilter.params)
 				}
 			}
 
