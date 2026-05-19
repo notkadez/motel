@@ -978,7 +978,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					);
 
 					CREATE INDEX IF NOT EXISTS idx_span_attributes_key_value ON span_attributes(key, value, trace_id, span_id);
-					CREATE INDEX IF NOT EXISTS idx_span_attributes_trace_span ON span_attributes(trace_id, span_id);
+					DROP INDEX IF EXISTS idx_span_attributes_trace_span;
 
 					CREATE TABLE IF NOT EXISTS log_attributes (
 						log_id INTEGER NOT NULL,
@@ -988,7 +988,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					);
 
 					CREATE INDEX IF NOT EXISTS idx_log_attributes_key_value ON log_attributes(key, value, log_id);
-					CREATE INDEX IF NOT EXISTS idx_log_attributes_log_id ON log_attributes(log_id);
+					DROP INDEX IF EXISTS idx_log_attributes_log_id;
 				`)
 			} catch (err) {
 				if (!isSqliteLockError(err)) throw err
