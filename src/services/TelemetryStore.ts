@@ -988,7 +988,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					);
 
 					CREATE INDEX IF NOT EXISTS idx_log_attributes_key_value ON log_attributes(key, value, log_id);
-					CREATE INDEX IF NOT EXISTS idx_log_attributes_log_id ON log_attributes(log_id);
+					DROP INDEX IF EXISTS idx_log_attributes_log_id;
 				`)
 			} catch (err) {
 				if (!isSqliteLockError(err)) throw err
